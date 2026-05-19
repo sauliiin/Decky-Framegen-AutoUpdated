@@ -1,5 +1,6 @@
 # Decky Framegen Plugin
 
+The original Dev 😉
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/B0B71HZTAX)
 
 A Steam Deck plugin that enables DLSS upscaling and Frame Generation on handhelds by utilizing the latest OptiScaler and supporting modification software. This plugin automatically installs and manages all necessary components for FSR-based frame generation in games that support DLSS, or OptiFG for adding FG to games that do not have any existing FG pathway (highly experimental)
@@ -78,7 +79,7 @@ Dx12Upscaler=fsr31 ~/fgmod/fgmod %command%
 ## Technical Details
 
 ### What's Included
-- **[OptiScaler 0.9.0-pre11](https://github.com/xXJSONDeruloXx/OptiScaler-Bleeding-Edge/releases/tag/opti-9-pre-11)**: Bleeding-edge OptiScaler bundle used by this plugin, paired with the RDNA2-optimized `amd_fidelityfx_upscaler_dx12.dll` override for Steam Deck compatibility
+- **[~~OptiScaler 0.9.0-pre11~~](https://github.com/xXJSONDeruloXx/OptiScaler-Bleeding-Edge/releases/tag/opti-9-pre-11)** **Always the latest OptiScaler**: Bleeding-edge OptiScaler bundle used by this plugin, paired with the RDNA2-optimized `amd_fidelityfx_upscaler_dx12.dll` override for Steam Deck compatibility
 - **Nukem9's DLSSG to FSR3 mod**: Allows use of DLSS inputs for FSR frame gen outputs, and xess or FSR upscaling outputs
 - **FakeNVAPI**: NVIDIA API emulation for AMD/Intel GPUs, to make DLSS options selectable in game
 - **Supporting Libraries**: All required DX12/Vulkan libraries (libxess.dll, amd_fidelityfx, etc.)
