@@ -4,6 +4,8 @@ import subprocess
 import json
 import shutil
 import re
+import tempfile
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,7 +13,7 @@ from pathlib import Path
 # Set to False or comment out this constant to skip the overwrite by default.
 UPSCALER_OVERWRITE_ENABLED = True
 
-VALID_DLL_NAMES = {
+PROXY_DLL_NAMES = [
     "dxgi.dll",
     "winmm.dll",
     "dbghelp.dll",
@@ -19,17 +21,16 @@ VALID_DLL_NAMES = {
     "wininet.dll",
     "winhttp.dll",
     "OptiScaler.asi",
-}
-
-INJECTOR_FILENAMES = [
-    "dxgi.dll",
-    "winmm.dll",
+]
+VALID_DLL_NAMES = set(PROXY_DLL_NAMES)
+LEGACY_INJECTOR_FILENAMES = [
     "nvngx.dll",
     "_nvngx.dll",
     "nvngx-wrapper.dll",
     "dlss-enabler.dll",
     "OptiScaler.dll",
 ]
+INJECTOR_FILENAMES = list(dict.fromkeys(PROXY_DLL_NAMES + LEGACY_INJECTOR_FILENAMES))
 
 ORIGINAL_DLL_BACKUPS = [
     "d3dcompiler_47.dll",
@@ -39,7 +40,7 @@ ORIGINAL_DLL_BACKUPS = [
     "amd_fidelityfx_vk.dll",
 ]
 
-SUPPORT_FILES = [
+LEGACY_SUPPORT_FILES = [
     "libxess.dll",
     "libxess_dx11.dll",
     "libxess_fg.dll",
@@ -54,6 +55,23 @@ SUPPORT_FILES = [
 ]
 
 MARKER_FILENAME = "FRAMEGEN_PATCH"
+INSTALLED_FILES_FILENAME = "FRAMEGEN_PATCH_FILES"
+CORE_FGMOD_FILES = [
+    "OptiScaler.dll",
+    "OptiScaler.ini",
+    "fgmod",
+    "fgmod-uninstaller.sh",
+    "update-optiscaler-config.py",
+]
+PAYLOAD_FILE_EXTENSIONS = {".asi", ".bin", ".cfg", ".dll", ".ini", ".json", ".toml"}
+PAYLOAD_FILE_EXCLUDES = {"OptiPatcher_rolling.asi", "OptiScaler.dll", "OptiScaler.ini"}
+PAYLOAD_DIR_EXCLUDES = {"renames", "plugins", "Licenses", "__pycache__"}
+
+OPTISCALER_LATEST_RELEASE_API = "https://api.github.com/repos/optiscaler/OptiScaler/releases/latest"
+OPTISCALER_RELEASES_API = "https://api.github.com/repos/optiscaler/OptiScaler/releases"
+OPTISCALER_ASSET_NAME_RE = re.compile(r"OptiScaler.*\.7z$|Optiscaler.*\.7z$", re.IGNORECASE)
+OPTISCALER_DOWNLOAD_TIMEOUT = 45
+OPTISCALER_LATEST_CACHE_SECONDS = 900
 
 BAD_EXE_SUBSTRINGS = [
     "crashreport",
@@ -85,11 +103,12 @@ LEGACY_FILES = [
     "_nvngx.dll",
     "dlssg_to_fsr3_amd_is_better-3.0.dll",
     "OptiScaler.asi",
-    "OptiScaler.ini",
     "OptiScaler.log",
 ]
 
 class Plugin:
+    _latest_optiscaler_release_cache = None
+
     async def _main(self):
         decky.logger.info("Framegen plugin loaded")
 
@@ -100,19 +119,9 @@ class Plugin:
         """Create renamed copies of the OptiScaler.dll file"""
         try:
             renames_dir.mkdir(exist_ok=True)
-            
-            rename_files = [
-                "dxgi.dll",
-                "winmm.dll",
-                "dbghelp.dll",
-                "version.dll",
-                "wininet.dll",
-                "winhttp.dll",
-                "OptiScaler.asi"
-            ]
-            
+
             if source_file.exists():
-                for rename_file in rename_files:
+                for rename_file in PROXY_DLL_NAMES:
                     dest_file = renames_dir / rename_file
                     shutil.copy2(source_file, dest_file)
                     decky.logger.info(f"Created renamed copy: {dest_file}")
@@ -259,8 +268,224 @@ class Plugin:
             decky.logger.error(f"Failed to modify OptiScaler.ini: {e}")
             return False
 
+    def _request_text(self, url):
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "Decky-Framegen",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=OPTISCALER_DOWNLOAD_TIMEOUT) as response:
+                return response.read().decode("utf-8")
+        except Exception as urllib_error:
+            decky.logger.warning(f"urllib request failed for {url}: {urllib_error}")
+
+        fallback_commands = [
+            [
+                "curl",
+                "-fsSL",
+                "-H",
+                "Accept: application/vnd.github+json",
+                "-H",
+                "User-Agent: Decky-Framegen",
+                url,
+            ],
+            [
+                "wget",
+                "-qO-",
+                "--header=Accept: application/vnd.github+json",
+                "--header=User-Agent: Decky-Framegen",
+                url,
+            ],
+        ]
+        errors = []
+        for command in fallback_commands:
+            if not shutil.which(command[0]):
+                errors.append(f"{command[0]} not installed")
+                continue
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode == 0 and result.stdout:
+                return result.stdout
+            errors.append(f"{command[0]} failed: {result.stderr.strip() or result.returncode}")
+
+        raise RuntimeError("; ".join(errors))
+
+    def _request_json(self, url):
+        return json.loads(self._request_text(url))
+
+    def _download_file(self, url, destination):
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Decky-Framegen"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=OPTISCALER_DOWNLOAD_TIMEOUT) as response:
+                with open(destination, "wb") as out_file:
+                    shutil.copyfileobj(response, out_file)
+                return
+        except Exception as urllib_error:
+            decky.logger.warning(f"urllib download failed for {url}: {urllib_error}")
+
+        fallback_commands = [
+            ["curl", "-fL", "-o", str(destination), url],
+            ["wget", "-O", str(destination), url],
+        ]
+        errors = []
+        for command in fallback_commands:
+            if not shutil.which(command[0]):
+                errors.append(f"{command[0]} not installed")
+                continue
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode == 0 and destination.exists() and destination.stat().st_size > 0:
+                return
+            errors.append(f"{command[0]} failed: {result.stderr.strip() or result.returncode}")
+
+        raise RuntimeError("; ".join(errors))
+
+    def _select_optiscaler_release_asset(self, release):
+        for asset in release.get("assets", []):
+            name = asset.get("name", "")
+            if OPTISCALER_ASSET_NAME_RE.search(name) and "BUNDLE" not in name.upper():
+                download_url = asset.get("browser_download_url")
+                if download_url:
+                    return asset
+        return None
+
+    def _include_optiscaler_prereleases(self):
+        include_prereleases = os.environ.get(
+            "DECKY_OPTISCALER_INCLUDE_PRERELEASES", "false"
+        ).lower() in ("1", "true", "yes")
+        return include_prereleases
+
+    def _optiscaler_release_metadata(self, release):
+        asset = self._select_optiscaler_release_asset(release)
+        if not asset:
+            return None
+        return {
+            "version": release.get("tag_name") or asset["name"].replace(".7z", ""),
+            "release_url": release.get("html_url"),
+            "asset_name": asset["name"],
+            "download_url": asset["browser_download_url"],
+        }
+
+    def _get_latest_optiscaler_release(self, use_cache=True):
+        """Return metadata for the newest usable OptiScaler release archive."""
+        include_prereleases = self._include_optiscaler_prereleases()
+        cache_key = "with-prereleases" if include_prereleases else "stable"
+        now = datetime.now(timezone.utc).timestamp()
+
+        if use_cache and self._latest_optiscaler_release_cache:
+            cached_key, cached_at, cached_release = self._latest_optiscaler_release_cache
+            if cached_key == cache_key and now - cached_at < OPTISCALER_LATEST_CACHE_SECONDS:
+                return cached_release
+
+        if not include_prereleases:
+            try:
+                latest_release = self._request_json(OPTISCALER_LATEST_RELEASE_API)
+                if not isinstance(latest_release, dict):
+                    raise RuntimeError("Unexpected GitHub latest release response")
+                release_metadata = self._optiscaler_release_metadata(latest_release)
+                if release_metadata:
+                    self._latest_optiscaler_release_cache = (cache_key, now, release_metadata)
+                    return release_metadata
+                decky.logger.warning(
+                    f"No OptiScaler .7z asset found in latest release {latest_release.get('tag_name')}"
+                )
+            except Exception as e:
+                decky.logger.warning(f"GitHub latest release endpoint failed: {e}")
+
+        releases = self._request_json(OPTISCALER_RELEASES_API)
+        if not isinstance(releases, list):
+            raise RuntimeError("Unexpected GitHub releases response")
+
+        for release in releases:
+            if release.get("draft"):
+                continue
+            if release.get("prerelease") and not include_prereleases:
+                continue
+
+            release_metadata = self._optiscaler_release_metadata(release)
+            if not release_metadata:
+                decky.logger.warning(
+                    f"No OptiScaler .7z asset found in release {release.get('tag_name')}"
+                )
+                continue
+
+            self._latest_optiscaler_release_cache = (cache_key, now, release_metadata)
+            return release_metadata
+
+        raise RuntimeError("No suitable OptiScaler release archive found")
+
+    def _download_latest_optiscaler_archive(self, download_dir):
+        """Download the newest OptiScaler release archive from GitHub Releases.
+
+        By default this skips prereleases, matching GitHub's stable "latest release"
+        behavior. Set DECKY_OPTISCALER_INCLUDE_PRERELEASES=true to allow prereleases.
+        """
+        release = self._get_latest_optiscaler_release(use_cache=False)
+        archive_path = download_dir / release["asset_name"]
+        decky.logger.info(
+            f"Downloading OptiScaler {release['version']} from {release['download_url']}"
+        )
+        self._download_file(release["download_url"], archive_path)
+        return {
+            "path": archive_path,
+            "version": release["version"],
+            "release_url": release.get("release_url"),
+        }
+
+    def _iter_fgmod_payload_files(self, fgmod_path):
+        """Return support files from the extracted bundle without pinning to a release."""
+        for source in sorted(fgmod_path.iterdir()):
+            if not source.is_file():
+                continue
+            if source.name in PAYLOAD_FILE_EXCLUDES:
+                continue
+            if source.suffix.lower() in PAYLOAD_FILE_EXTENSIONS:
+                yield source
+
+    def _iter_fgmod_payload_dirs(self, fgmod_path):
+        """Return support directories from the extracted bundle without pinning names."""
+        for source in sorted(fgmod_path.iterdir()):
+            if not source.is_dir():
+                continue
+            if source.name in PAYLOAD_DIR_EXCLUDES:
+                continue
+            yield source
+
+    def _ensure_fsr4_upscaler_override(self, fgmod_path):
+        """Keep the installed fgmod bundle using the bundled FSR 4-capable upscaler DLL."""
+        if not UPSCALER_OVERWRITE_ENABLED:
+            return False
+        if os.environ.get("DECKY_SKIP_UPSCALER_OVERWRITE", "false").lower() in ("1", "true", "yes"):
+            return False
+
+        try:
+            upscaler_src = Path(decky.DECKY_PLUGIN_DIR) / "bin" / "amd_fidelityfx_upscaler_dx12.dll"
+            upscaler_dst = fgmod_path / "amd_fidelityfx_upscaler_dx12.dll"
+            if not upscaler_src.exists():
+                decky.logger.warning("FSR 4-capable upscaler DLL not found in plugin bin")
+                return False
+
+            if upscaler_dst.exists() and upscaler_src.stat().st_size == upscaler_dst.stat().st_size:
+                try:
+                    if upscaler_src.read_bytes() == upscaler_dst.read_bytes():
+                        return False
+                except Exception:
+                    pass
+
+            shutil.copy2(upscaler_src, upscaler_dst)
+            decky.logger.info("Updated fgmod amd_fidelityfx_upscaler_dx12.dll with FSR 4-capable binary")
+            return True
+        except Exception as e:
+            decky.logger.warning(f"Failed to update fgmod FSR 4 upscaler DLL: {e}")
+            return False
+
     async def extract_static_optiscaler(self) -> dict:
         """Extract OptiScaler from the plugin's bin directory and copy additional files."""
+        temp_download_dir = None
         try:
             decky.logger.info("Starting extract_static_optiscaler method")
             
@@ -280,19 +505,36 @@ class Plugin:
             bin_files = list(bin_path.glob("*"))
             decky.logger.info(f"Files in bin directory: {[f.name for f in bin_files]}")
             
-            # Find the OptiScaler archive in the bin directory
+            temp_download_dir = tempfile.TemporaryDirectory()
+            temp_download_path = Path(temp_download_dir.name)
+            release_metadata = None
+
+            # Prefer the newest archive published by optiscaler/OptiScaler. The
+            # bundled archive remains a fallback so setup can still work offline.
             optiscaler_archive = None
-            for file in bin_path.glob("*.7z"):
-                decky.logger.info(f"Checking 7z file: {file.name}")
-                # Check for both "OptiScaler" and "Optiscaler" (case variations) and exclude BUNDLE files
-                if ("OptiScaler" in file.name or "Optiscaler" in file.name) and "BUNDLE" not in file.name:
-                    optiscaler_archive = file
-                    decky.logger.info(f"Found OptiScaler archive: {file.name}")
-                    break
+            try:
+                release_metadata = self._download_latest_optiscaler_archive(temp_download_path)
+                optiscaler_archive = release_metadata["path"]
+                decky.logger.info(
+                    f"Using latest OptiScaler archive from GitHub: {optiscaler_archive.name}"
+                )
+            except Exception as e:
+                decky.logger.warning(
+                    f"Failed to download latest OptiScaler release, falling back to bundled archive: {e}"
+                )
+
+                for file in bin_path.glob("*.7z"):
+                    decky.logger.info(f"Checking bundled 7z file: {file.name}")
+                    # Check for both "OptiScaler" and "Optiscaler" (case variations) and exclude BUNDLE files
+                    if ("OptiScaler" in file.name or "Optiscaler" in file.name) and "BUNDLE" not in file.name:
+                        optiscaler_archive = file
+                        decky.logger.info(f"Found bundled OptiScaler archive: {file.name}")
+                        break
             
             if not optiscaler_archive:
-                decky.logger.error("OptiScaler archive not found in plugin bin directory")
-                return {"status": "error", "message": "OptiScaler archive not found in plugin bin directory"}
+                decky.logger.error("OptiScaler archive not found in GitHub releases or plugin bin directory")
+                temp_download_dir.cleanup()
+                return {"status": "error", "message": "OptiScaler archive not found in GitHub releases or plugin bin directory"}
             
             decky.logger.info(f"Using archive: {optiscaler_archive}")
             
@@ -337,14 +579,26 @@ class Plugin:
             
             if extract_result.returncode != 0:
                 decky.logger.error(f"Extraction failed: {extract_result.stderr}")
+                temp_download_dir.cleanup()
+                shutil.rmtree(extract_path, ignore_errors=True)
                 return {
                     "status": "error",
                     "message": f"Failed to extract OptiScaler archive: {extract_result.stderr}"
                 }
+
+            temp_download_dir.cleanup()
+
+            for core_file in ("OptiScaler.dll", "OptiScaler.ini"):
+                if not (extract_path / core_file).exists():
+                    shutil.rmtree(extract_path, ignore_errors=True)
+                    return {
+                        "status": "error",
+                        "message": f"Downloaded OptiScaler archive is missing required file: {core_file}"
+                    }
             
             # Copy additional individual files from bin directory
-            # Note: v0.9.0-final includes dlssg_to_fsr3_amd_is_better.dll, fakenvapi.dll, and fakenvapi.ini in the 7z
-            # Only copy files that aren't already in the archive (separate remote binaries)
+            # Only copy files that aren't part of the OptiScaler release archive
+            # itself. Support DLLs from the archive are copied dynamically below.
             # nvngx.dll is intentionally excluded: it was a stale DLSS 3.10.3 stub from a
             # pre-0.9 nightly that is missing DLSS 3.1+ exports (AllocateParameters,
             # GetCapabilityParameters, Init_with_ProjectID, etc.) present in OptiScaler
@@ -365,10 +619,7 @@ class Plugin:
                     decky.logger.info(f"Copied additional file: {file_name}")
                 else:
                     decky.logger.warning(f"Additional file not found: {file_name}")
-                    return {
-                        "status": "error",
-                        "message": f"Required file {file_name} not found in plugin bin directory"
-                    }
+                    decky.logger.warning("Continuing without optional additional file")
             
             decky.logger.info("Creating renamed copies of OptiScaler.dll")
             # Create renamed copies of OptiScaler.dll
@@ -401,8 +652,8 @@ class Plugin:
                 decky.logger.error(f"Failed to setup ASI plugins directory: {e}")
 
             decky.logger.info("Starting upscaler DLL overwrite check")
-            # Optionally overwrite amd_fidelityfx_upscaler_dx12.dll with the separately bundled
-            # RDNA2-optimized static binary used for Steam Deck compatibility.
+            # Overwrite amd_fidelityfx_upscaler_dx12.dll with the separately bundled
+            # FSR 4-capable static binary used for Steam Deck compatibility.
             # Toggle via env DECKY_SKIP_UPSCALER_OVERWRITE=true to skip.
             try:
                 skip_overwrite = os.environ.get("DECKY_SKIP_UPSCALER_OVERWRITE", "false").lower() in ("1", "true", "yes")
@@ -411,22 +662,25 @@ class Plugin:
                     upscaler_dst = extract_path / "amd_fidelityfx_upscaler_dx12.dll"
                     if upscaler_src.exists():
                         shutil.copy2(upscaler_src, upscaler_dst)
-                        decky.logger.info("Overwrote amd_fidelityfx_upscaler_dx12.dll with static remote binary")
+                        decky.logger.info("Overwrote amd_fidelityfx_upscaler_dx12.dll with FSR 4-capable static binary")
                     else:
                         decky.logger.warning("amd_fidelityfx_upscaler_dx12.dll not found in bin; skipping overwrite")
                 else:
-                    decky.logger.info("Skipping upscaler DLL overwrite due to DECKY_SKIP_UPSCALER_OVERWRITE")
+                    decky.logger.info("Skipping upscaler DLL overwrite")
             except Exception as e:
                 decky.logger.error(f"Failed upscaler overwrite step: {e}")
             
-            # Extract version from filename (e.g., OptiScaler_0.7.9.7z -> v0.7.9)
-            version_match = optiscaler_archive.name.replace('.7z', '')
-            if 'OptiScaler_' in version_match:
-                version = 'v' + version_match.split('OptiScaler_')[1]
-            elif 'Optiscaler_' in version_match:
-                version = 'v' + version_match.split('Optiscaler_')[1]
+            if release_metadata:
+                version = release_metadata["version"]
             else:
-                version = version_match
+                # Extract version from filename (e.g., OptiScaler_0.7.9.7z -> v0.7.9)
+                version_match = optiscaler_archive.name.replace('.7z', '')
+                if 'OptiScaler_' in version_match:
+                    version = 'v' + version_match.split('OptiScaler_')[1]
+                elif 'Optiscaler_' in version_match:
+                    version = 'v' + version_match.split('Optiscaler_')[1]
+                else:
+                    version = version_match
             
             # Create version file
             version_file = extract_path / "version.txt"
@@ -450,6 +704,8 @@ class Plugin:
             }
             
         except Exception as e:
+            if temp_download_dir is not None:
+                temp_download_dir.cleanup()
             decky.logger.error(f"Extract failed with exception: {str(e)}")
             decky.logger.error(f"Exception type: {type(e).__name__}")
             import traceback
@@ -484,9 +740,9 @@ class Plugin:
 
     async def run_install_fgmod(self) -> dict:
         try:
-            decky.logger.info("Starting OptiScaler installation from static bundle")
+            decky.logger.info("Starting OptiScaler installation from latest GitHub release")
             
-            # Extract the static OptiScaler bundle
+            # Download the latest OptiScaler release and extract it, with bundled fallback.
             extract_result = await self.extract_static_optiscaler()
             
             if extract_result["status"] != "success":
@@ -494,10 +750,13 @@ class Plugin:
                     "status": "error",
                     "message": f"OptiScaler extraction failed: {extract_result.get('message', 'Unknown error')}"
                 }
-            
+
+            version = extract_result.get("version", "latest")
             return {
                 "status": "success",
-                "output": "Successfully installed OptiScaler with all necessary components! You can now replace DLSS with FSR Frame Gen!"
+                "message": f"OptiScaler {version} installed successfully.",
+                "output": f"Successfully installed OptiScaler {version} with all necessary components! You can now replace DLSS with FSR Frame Gen!",
+                "version": version
             }
 
         except Exception as e:
@@ -509,37 +768,57 @@ class Plugin:
 
     async def check_fgmod_path(self) -> dict:
         path = Path(decky.HOME) / "fgmod"
-        required_files = [
-            "OptiScaler.dll",
-            "OptiScaler.ini",
-            "dlssg_to_fsr3_amd_is_better.dll", 
-            "fakenvapi.dll",        # v0.9.0-final includes fakenvapi.dll in archive
-            "fakenvapi.ini",
-            "amd_fidelityfx_dx12.dll",
-            "amd_fidelityfx_framegeneration_dx12.dll",
-            "amd_fidelityfx_upscaler_dx12.dll",
-            "amd_fidelityfx_vk.dll", 
-            "libxess.dll",
-            "libxess_dx11.dll",
-            "libxess_fg.dll",       # added in v0.9.0
-            "libxell.dll",          # added in v0.9.0
-            "fgmod",
-            "fgmod-uninstaller.sh",
-            "update-optiscaler-config.py"
-        ]
 
         if path.exists():
-            # Check required files
-            for file_name in required_files:
+            # Keep this check intentionally small. OptiScaler support DLLs can be
+            # added, removed, or renamed between releases; extraction succeeds as
+            # long as the stable core files and launcher scripts are present.
+            for file_name in CORE_FGMOD_FILES:
                 if not path.joinpath(file_name).exists():
                     return {"exists": False}
 
-            # Check plugins directory and OptiPatcher ASI
-            plugins_dir = path / "plugins"
-            if not plugins_dir.exists() or not (plugins_dir / "OptiPatcher.asi").exists():
-                return {"exists": False}
+            fsr4_upscaler_updated = self._ensure_fsr4_upscaler_override(path)
 
-            return {"exists": True}
+            payload_files = [source.name for source in self._iter_fgmod_payload_files(path)]
+            if not payload_files:
+                decky.logger.warning("No OptiScaler support payload files found in fgmod bundle")
+            payload_dirs = [source.name for source in self._iter_fgmod_payload_dirs(path)]
+
+            # OptiPatcher improves spoofing, but do not mark the whole OptiScaler
+            # install as missing if that separately bundled helper changes.
+            plugins_dir = path / "plugins"
+            optipatcher_available = plugins_dir.exists() and (plugins_dir / "OptiPatcher.asi").exists()
+
+            version = None
+            version_file = path / "version.txt"
+            if version_file.exists():
+                try:
+                    version = version_file.read_text().strip()
+                except Exception as e:
+                    decky.logger.warning(f"Failed to read OptiScaler version file: {e}")
+
+            latest_version = None
+            update_available = False
+            latest_check_error = None
+            try:
+                latest_release = self._get_latest_optiscaler_release()
+                latest_version = latest_release.get("version")
+                update_available = bool(latest_version and latest_version != version)
+            except Exception as e:
+                latest_check_error = str(e)
+                decky.logger.warning(f"Failed to check latest OptiScaler release: {e}")
+
+            return {
+                "exists": True,
+                "version": version,
+                "latest_version": latest_version,
+                "update_available": update_available,
+                "latest_check_error": latest_check_error,
+                "fsr4_upscaler_updated": fsr4_upscaler_updated,
+                "payload_files": payload_files,
+                "payload_dirs": payload_dirs,
+                "optipatcher_available": optipatcher_available,
+            }
         else:
             return {"exists": False}
 
@@ -574,6 +853,7 @@ class Plugin:
 
         try:
             decky.logger.info(f"Manual patch started for {directory}")
+            payload_sources = list(self._iter_fgmod_payload_files(fgmod_path))
 
             removed_injectors = []
             for filename in INJECTOR_FILENAMES:
@@ -584,13 +864,16 @@ class Plugin:
             decky.logger.info(f"Removed injector DLLs: {removed_injectors}" if removed_injectors else "No injector DLLs found to remove")
 
             backed_up_originals = []
-            for dll in ORIGINAL_DLL_BACKUPS:
-                source = directory / dll
-                backup = directory / f"{dll}.b"
+            backup_candidates = list(dict.fromkeys(
+                ORIGINAL_DLL_BACKUPS + [source.name for source in payload_sources]
+            ))
+            for filename in backup_candidates:
+                source = directory / filename
+                backup = directory / f"{filename}.b"
                 if source.exists() and not backup.exists():
                     shutil.move(source, backup)
-                    backed_up_originals.append(dll)
-            decky.logger.info(f"Backed up original DLLs: {backed_up_originals}" if backed_up_originals else "No original DLLs required backup")
+                    backed_up_originals.append(filename)
+            decky.logger.info(f"Backed up original files: {backed_up_originals}" if backed_up_originals else "No original files required backup")
 
             removed_legacy = []
             for legacy in ["nvapi64.dll", "nvapi64.dll.b"]:
@@ -608,10 +891,12 @@ class Plugin:
 
             target_ini = directory / "OptiScaler.ini"
             source_ini = fgmod_path / "OptiScaler.ini"
+            copied_ini = False
             if preserve_ini and target_ini.exists():
                 decky.logger.info(f"Preserving existing OptiScaler.ini at {target_ini}")
             elif source_ini.exists():
                 shutil.copy2(source_ini, target_ini)
+                copied_ini = True
                 decky.logger.info(f"Copied OptiScaler.ini from {source_ini} to {target_ini}")
             else:
                 decky.logger.warning("No OptiScaler.ini found to copy")
@@ -628,33 +913,41 @@ class Plugin:
             else:
                 decky.logger.warning("Plugins directory missing in fgmod bundle")
 
-            d3d12_src = fgmod_path / "D3D12_Optiscaler"
-            d3d12_dest = directory / "D3D12_Optiscaler"
-            if d3d12_src.exists():
-                shutil.copytree(d3d12_src, d3d12_dest, dirs_exist_ok=True)
-                decky.logger.info(f"Copied D3D12_Optiscaler directory to {d3d12_dest}")
-            else:
-                decky.logger.warning("D3D12_Optiscaler directory missing in fgmod bundle")
+            copied_dirs = []
+            for source_dir in self._iter_fgmod_payload_dirs(fgmod_path):
+                dest_dir = directory / source_dir.name
+                shutil.copytree(source_dir, dest_dir, dirs_exist_ok=True)
+                copied_dirs.append(source_dir.name)
+            if copied_dirs:
+                decky.logger.info(f"Copied support directories: {copied_dirs}")
 
             copied_support = []
-            missing_support = []
-            for filename in SUPPORT_FILES:
-                source = fgmod_path / filename
-                dest = directory / filename
-                if source.exists():
-                    shutil.copy2(source, dest)
-                    copied_support.append(filename)
-                else:
-                    missing_support.append(filename)
+            for source in payload_sources:
+                dest = directory / source.name
+                shutil.copy2(source, dest)
+                copied_support.append(source.name)
             if copied_support:
                 decky.logger.info(f"Copied support files: {copied_support}")
-            if missing_support:
-                decky.logger.warning(f"Support files missing from fgmod bundle: {missing_support}")
+            else:
+                decky.logger.warning("No support payload files found in fgmod bundle")
+
+            installed_files = copied_support + [dll_name]
+            if copied_ini:
+                installed_files.append("OptiScaler.ini")
+            installed_files = sorted(set(installed_files))
+            manifest_path = directory / INSTALLED_FILES_FILENAME
+            try:
+                with open(manifest_path, "w", encoding="utf-8") as f:
+                    json.dump({"files": installed_files, "dirs": copied_dirs}, f, indent=2)
+                decky.logger.info(f"Wrote installed file manifest: {manifest_path}")
+            except Exception as exc:
+                decky.logger.warning(f"Failed to write installed file manifest: {exc}")
 
             decky.logger.info(f"Manual patch complete for {directory}")
             return {
                 "status": "success",
                 "message": f"OptiScaler files copied to {directory}",
+                "backed_up_files": backed_up_originals,
             }
 
         except PermissionError as exc:
@@ -674,13 +967,54 @@ class Plugin:
         try:
             decky.logger.info(f"Manual unpatch started for {directory}")
 
+            manifest_path = directory / INSTALLED_FILES_FILENAME
+            manifest_files = []
+            manifest_dirs = []
+            if manifest_path.exists():
+                try:
+                    with open(manifest_path, "r", encoding="utf-8") as f:
+                        manifest = json.load(f)
+                    files = manifest.get("files", [])
+                    if isinstance(files, list):
+                        manifest_files = [
+                            str(name)
+                            for name in files
+                            if isinstance(name, str)
+                            and "/" not in name
+                            and "\\" not in name
+                            and ".." not in name
+                        ]
+                    dirs = manifest.get("dirs", [])
+                    if isinstance(dirs, list):
+                        manifest_dirs = [
+                            str(name)
+                            for name in dirs
+                            if isinstance(name, str)
+                            and "/" not in name
+                            and "\\" not in name
+                            and ".." not in name
+                        ]
+                except Exception as exc:
+                    decky.logger.warning(f"Failed to read installed file manifest: {exc}")
+
             removed_files = []
-            for filename in set(INJECTOR_FILENAMES + SUPPORT_FILES):
+            for filename in set(INJECTOR_FILENAMES + LEGACY_SUPPORT_FILES + manifest_files):
                 path = directory / filename
                 if path.exists():
                     path.unlink()
                     removed_files.append(filename)
             decky.logger.info(f"Removed injector/support files: {removed_files}" if removed_files else "No injector/support files found to remove")
+            if manifest_path.exists():
+                manifest_path.unlink()
+
+            removed_dirs = []
+            for dirname in manifest_dirs:
+                path = directory / dirname
+                if path.exists() and path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                    removed_dirs.append(dirname)
+            if removed_dirs:
+                decky.logger.info(f"Removed manifest support directories: {removed_dirs}")
 
             legacy_removed = []
             for legacy in LEGACY_FILES:
@@ -704,14 +1038,15 @@ class Plugin:
                 decky.logger.info(f"Removed D3D12_Optiscaler directory from {d3d12_dir}")
 
             restored_backups = []
-            for dll in ORIGINAL_DLL_BACKUPS:
-                backup = directory / f"{dll}.b"
-                original = directory / dll
+            restore_candidates = set(ORIGINAL_DLL_BACKUPS + LEGACY_SUPPORT_FILES + manifest_files)
+            for filename in restore_candidates:
+                backup = directory / f"{filename}.b"
+                original = directory / filename
                 if backup.exists():
                     if original.exists():
                         original.unlink()
                     shutil.move(backup, original)
-                    restored_backups.append(dll)
+                    restored_backups.append(filename)
             decky.logger.info(f"Restored backups: {restored_backups}" if restored_backups else "No backups found to restore")
 
             uninstaller = directory / "fgmod-uninstaller.sh"
@@ -1131,7 +1466,9 @@ class Plugin:
             if result["status"] != "success":
                 return result
 
-            backed_up = [dll for dll in ORIGINAL_DLL_BACKUPS if (target_dir / f"{dll}.b").exists()]
+            backed_up = result.get("backed_up_files")
+            if not isinstance(backed_up, list):
+                backed_up = [dll for dll in ORIGINAL_DLL_BACKUPS if (target_dir / f"{dll}.b").exists()]
             marker_path = target_dir / MARKER_FILENAME
             self._write_marker(
                 marker_path,

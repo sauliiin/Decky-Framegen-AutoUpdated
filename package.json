@@ -53,9 +53,9 @@
   "remote_binary": 
   [
     {
-      "sha256hash":  "a988ce2c0a86bba58a6313659d1ed2ab78f994dbdfab246394a2e4293ac68010",
-      "url":  "https://github.com/optiscaler/OptiScaler/releases/download/v0.9.0/Optiscaler_0.9.0-final.20260401._AF.7z",
-      "name":  "Optiscaler_0.9.0-final.20260401._AF.7z"
+      "sha256hash":  "56d1a18e3a32d978c0134844e803ba8cf04134226cfcdb8283f68d180836fab0",
+      "url":  "https://github.com/optiscaler/OptiScaler/releases/download/v0.9.1/Optiscaler_0.9.1-final.20260427._DSB.7z",
+      "name":  "Optiscaler_0.9.1-final.20260427._DSB.7z"
     },
     {
       "sha256hash": "c7720bc16bede334f59a1a32cd22edbcbbb159685ed5240e61350a5fb0bc8a94",
